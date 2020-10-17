@@ -1,0 +1,43 @@
+---
+title: "The Riddler 7/14/17"
+author: "Matt Kalin"
+date: "7/14/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+The Riddler is a special on the website FiveThirtyEight where every week they give readers two puzzles and reveal the answers to last week's puzzles.  Here is the prompt to the Riddler Classic from July 14, 2017: 
+
+From Dave Moran, a pricy postseason puzzler:
+
+Congratulations! The Acme Axegrinders, which you own, are the regular season champions of the National Squishyball League (NSL). Your team will now play a championship series against the Boondocks Barbarians, which had the second-best regular season record. You feel good about Acme’s chances in the series because Acme won exactly 60 percent of the hundreds of games it played against Boondocks this season. (The NSL has an incredibly long regular season.) The NSL has two special rules for the playoffs:
+
+The owner of the top-seeded team (i.e., you) gets to select the length of the championship series in advance of the first game, so you could decide to play a single game, a best two out of three series, a three out of five series, etc., all the way up to a 50 out of 99 series.
+The owner of the winning team gets $1 million minus $10,000 for each of the victories required to win the series, regardless of how many games the series lasts in total. Thus, if the top-seeded team’s owner selects a single-game championship, the winning owner will collect $990,000. If he or she selects a 4 out of 7 series, the winning team’s owner will collect $960,000. The owner of the losing team gets nothing.
+Since Acme has a 60 percent chance of winning any individual game against Boondocks, Rule 1 encourages you to opt for a very long series to improve Acme’s chances of winning the series. But Rule 2 means that a long series will mean less winnings for you if Acme does take the series.
+
+How long a series should you select in order to maximize your expected winnings? And how much money do you expect to win?
+
+## Approach
+For every number between 1 and 100, I calculated the expected prize for a series where the winner had to win i games. For example, when i = 4, it is determining the expected prize for a best-of-7 series (the winner of a best-of-7 has to win 4 games). I used the negative binomial distribution to answer the question: what is the probability that I win i games while losing at most i - 1 games, given I have a 0.6 probability of winning each game? I also calculated the prize using the provided formula: prize = $1,000,000 - $10,000 * (victories).  I multiplied those two values together to get the expected prize, using the law of conditional expectation.  
+
+```{r cars}
+expectation = numeric() 
+for (i in 1:100) {
+  win.prob = pnbinom(i - 1, i, 0.6) # must win i times while losing at most i - 1 times
+  prize = 1000000 - 10000 * i
+  x = win.prob * prize # expectation 
+  expectation[i] = x
+}
+max.index = which.max(expectation)
+max.prize = max(expectation)
+optimal.series = max.index * 2 - 1 # best-of-x series
+print(paste0("We should select a best-of-", optimal.series, " series, where our expected prize will be $", round(max.prize)))
+```
+
+I found that the prize was maximized at $736,222 when we needed 13 games to win, which is a best-of-25 series. The following week the answer was revealed: "You should select a best-of-25 series, where the first team to 13 wins takes the title. You stand to win about $736,222 on average." This was exactly the same as the answer I arrived at, so I got this one correct. 

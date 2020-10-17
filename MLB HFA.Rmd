@@ -1,0 +1,305 @@
+---
+title: "MLB Home Field Advantage"
+author: "Matt Kalin"
+date: "March 16, 2020"
+output: html_document
+---
+## Abstract
+In the Major League Baseball regular season, teams play three or four-game series against each other. The only game where either team traveled the day before is the opening game of the series, since the teams stay in town during the series. I was wondering if the number of rest days and/or the distance they had to travel would affect the rate at which the home team wins. I found that the only thing significant in predicting the winner of the opening game was the two teams' strength (I used their total season Pythagorean winning percentage as an estimate), and that travel and rest did not have a significant impact.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Step 1: Import Team Info
+
+The first thing I did was get team information from ESPN; specifically, the team names and their url extension (so we can scrape their schedules later). 
+
+```{r teams, include=TRUE}
+library(dplyr)
+library(httr)
+library(XML)
+library(stringr)
+teams.url = "https://www.espn.com/mlb/teams"
+teams.html = rawToChar(GET(teams.url)$content)
+h2.end.locs = gregexpr("/h2", teams.html)[[1]] # team headers end with an h2
+mlb.teams = NA
+espn.ids = NA
+for (i in 1:length(h2.end.locs)) {
+  html.substr = substr(teams.html, h2.end.locs[i] - 30, h2.end.locs[i] + 300)
+  mlb.teams[i] = html.substr %>% 
+    str_extract(">.*?<") %>% # extract text between >...<
+    str_replace(".{1}$", "") %>% # remove last character (<)
+    str_replace("^.{1}", "") # remove first character (>)
+  espn.ids[i] = html.substr %>%
+    str_extract("/name/.*?/") %>% # extract text 
+    str_replace(".{1}$", "") %>% # remove last character (/)
+    str_replace("^.{6}", "") # remove "/name/"
+} 
+
+```
+
+## Step 2: Get team location info and merge with other info
+I copied (and manually tidied) a table from wikipedia listing every team's location in longitude-latitude coordinates.  I then converted the degrees-minutes-seconds format to degrees as a floating point value so the coordinates are compatible with the distHaversine function of the geosphere package to calculate the distance between two coordinate sets. 
+
+```{r locations, include=TRUE}
+# source: "https://en.wikipedia.org/wiki/Major_League_Baseball"
+library(readxl)
+wiki.table = as.data.frame(read_excel("/Users/malexk999/Desktop/Cloud desktop/Miscellaneous/Coding/R/MLB/MLB Team info.xlsx"))
+master.table = data.frame("Team" = mlb.teams, "ESPN.ID" = espn.ids, "Latitude" = NA, "Longitude" = NA)
+DegMinSecToCoordinates = function(deg.min.sec){
+  return(deg.min.sec[1] + deg.min.sec[2] / 60 + deg.min.sec[3] / 3600)
+}
+StringToCoordinates = function(coord.string){ 
+  numbers = (coord.string %>% 
+    str_extract_all("\\d*"))[[1]] %>% 
+    as.numeric() %>% 
+    na.omit()
+  return(c(DegMinSecToCoordinates(numbers[1:3]), DegMinSecToCoordinates(numbers[4:6])))
+} # first one is latitude
+wiki.index = match(master.table$Team, wiki.table$Team)
+for (i in 1:nrow(master.table)) {
+  master.table[i, c("Latitude", "Longitude")] = StringToCoordinates(wiki.table[wiki.index[i], "Coordinates"])
+}
+
+```
+## Step 3: Import the standings from each year
+I imported the standings from ESPN, which included runs scored and runs against. I used these to calculate each team's pythagorean winning percentage, which is an estimate of the team's true strength.  
+
+```{r standings, include=TRUE}
+library(rvest)
+minYear = 2010
+maxYear = 2019
+# analysis is for the decade 2010-2019
+yearRange = minYear:maxYear
+mlb.ratings = data.frame()
+for (yr in yearRange) {
+  standings.url = paste0("https://www.espn.com/mlb/standings/_/season/", yr)
+  standings.data = html_table(html_nodes(read_html(standings.url), "table"))
+  standings.teams = rbind(standings.data[[1]], standings.data[[3]])[,1] %>% 
+    as.character()
+  standings.stats = rbind(standings.data[[2]], standings.data[[4]]) 
+  # 1 and 3 are teams, 2 and 4 are rest of table 
+  team.ratings = data.frame("Team" = mlb.teams, "Season" = yr, "RS" = NA, "RA" = NA)
+  for (i in 1:length(mlb.teams)) {
+    index = grep(mlb.teams[i], standings.teams)
+    if(length(index) < 1){
+      index = grep("Florida Marlins", standings.teams) 
+      # the Miami Marlins used to be known as the Florida Marlins
+    }
+    team.ratings[i, 3:4] = standings.stats[index, 7:8] %>% 
+      as.numeric() # convert from character/string to numeric 
+  }
+  mlb.ratings = mlb.ratings %>% 
+    rbind(team.ratings) # add to the master data frame
+}
+mlb.ratings = mlb.ratings %>% 
+  mutate(Pyth = RS ^ 1.83 / (RS ^ 1.83 + RA ^ 1.83)) %>% # calculate pythagorean win pct
+  mutate(Log.Rate = -log(1 / Pyth - 1)) # use logit function to convert to a scale better for a linear model 
+
+# inverse: wpct = 1/(exp(b.rate - a.rate) + 1)
+
+```
+
+## Step 4: Analyze each team's schedule and travel patterns
+I scraped each team's schedule from the 2010-2019 MLB seasons. I created a data frame recording each team's series openers and how far they had to travel from the previous series and how many rest days they had. 
+
+```{r schedules, include=TRUE}
+# library(stringr)
+library(lubridate)
+library(geosphere)
+FirstRowAsHeader = function(df){
+  for(i in 1:ncol(df)){
+      names(df)[i] = as.character(df[1, i])
+    }
+  # names(df) = df[1, ]
+  df = df[-c(1), ]
+  return(df)
+}
+GetSiteDist = function(hosts){
+  # hosts is a vector of length 2 representing the two teams' names
+  coords1 = master.table[match(hosts[1], mlb.teams), c("Longitude", "Latitude")]
+  coords2 = master.table[match(hosts[2], mlb.teams), c("Longitude", "Latitude")]
+  return(distHaversine(coords1, coords2, r = 3959))
+}
+error.urls = NULL
+opening.games.data = data.frame()
+# pb = txtProgressBar(0, length(yearRange) * length(mlb.teams), style = 3)
+for (yr in yearRange) {
+  # print(yr)
+  for (i in 1:length(mlb.teams)) {
+    team.id = espn.ids[i]
+    # print(mlb.teams[i])
+    for (szn.half in 1:2) {
+      error.caught = FALSE
+      sched.url = paste0("https://www.espn.com/mlb/team/schedule/_/name/", team.id, "/season/", yr, "/seasontype/2/half/", szn.half)
+      sched.html = rawToChar(GET(sched.url)$content)
+      tryCatch({
+        sched.table = html_table(html_nodes(read_html(sched.url), "table"))[[1]] %>% 
+          FirstRowAsHeader()
+      }, error = function(e){
+        error.urls <<- c(error.urls, sched.url)
+        error.caught <<- TRUE
+        print(paste(mlb.teams[i], yr, "half", szn.half, "failed"))
+      })
+      if(error.caught){
+        next()
+      }
+      home.strs = gregexpr(">vs<", sched.html)[[1]]
+      away.strs = gregexpr(">@<", sched.html)[[1]]
+      home.rows = grep("vs", sched.table$OPPONENT)
+      away.rows = grep("@", sched.table$OPPONENT)      
+      sched.table$Perpective = mlb.teams[i]
+      sched.table$Opp.Tm = NA
+      sched.table$Host = NA
+      for (j in 1:length(home.strs)) {
+        opp.start = regexpr("mlb/team/_/name", substr(sched.html, home.strs[j], home.strs[j] + 200))
+        opp.id = substr(sched.html, home.strs[j], home.strs[j] + 200) %>% 
+          str_match("mlb/team/_/name/[a-z]{2,3}/") %>% # find url with id
+          str_replace("^.{16}", "") %>% # remove beginning of string
+          str_replace(".{1}$", "") # remove last "/"
+        sched.table[home.rows[j], "Opp.Tm"] = mlb.teams[match(opp.id, espn.ids)]
+        sched.table[home.rows[j], "Host"] = mlb.teams[i]
+      }
+      for (j in 1:length(away.strs)) {
+        opp.start = regexpr("mlb/team/_/name", substr(sched.html, away.strs[j], away.strs[j] + 200))
+        opp.id = substr(sched.html, away.strs[j], away.strs[j] + 200) %>% 
+          str_match("mlb/team/_/name/[a-z]{2,3}/") %>% # find url with id
+          str_replace("^.{16}", "") %>% # remove beginning of string
+          str_replace(".{1}$", "") # remove last "/"
+        sched.table[away.rows[j], c("Opp.Tm", "Host")] = mlb.teams[match(opp.id, espn.ids)]
+        
+      }
+      {
+        na.index = which(is.na(sched.table$Opp.Tm))
+        if(length(na.index) > 0){
+          marlins.index = na.index[grep("Florida", sched.table[na.index, "OPPONENT"])]
+          sched.table[marlins.index, "Opp.Tm"] = "Miami Marlins"
+          sched.table[na.index[which(is.na(sched.table[marlins.index, "Host"]))], "Host"] = "Miami Marlins"
+        }
+      } # florida marlins
+      sched.table = sched.table %>%
+        slice(grep("(W|L)\\d{1,2}-\\d{1,2}", sched.table$RESULT))
+      sched.table$Game.Date = sched.table$DATE %>% 
+        str_replace("^.{5}", "") %>% 
+        paste(yr) %>% 
+        mdy()
+      sched.table$Series.Game = NA
+      sched.table$Days.Rest = NA
+      for (j in 1:nrow(sched.table)) {
+        if(j == 1){
+          sched.table[j, "Series.Game"] = 1
+        } else {
+          if(sched.table[j, "Opp.Tm"] == sched.table[j - 1, "Opp.Tm"] & 
+             sched.table[j, "Host"] == sched.table[j - 1, "Host"]){
+            sched.table[j, "Series.Game"] = sched.table[j - 1, "Series.Game"] + 1
+          } else {
+            sched.table[j, "Series.Game"] = 1
+          }
+          sched.table[j, "Days.Rest"] = sched.table[j, "Game.Date"] - sched.table[j - 1, "Game.Date"]
+        }
+      }
+      first.games = sched.table %>% 
+        filter(Series.Game == 1)
+      first.games$Travel.Dist = NA
+      for (j in 2:nrow(first.games)) {
+        first.games[j, "Travel.Dist"] = GetSiteDist(first.games[(j-1):j, "Host"])
+      }
+      first.games$Series.Num = 1:nrow(first.games)
+      opening.games.data = opening.games.data %>% 
+        rbind(first.games[-1,])
+    }
+    # setTxtProgressBar(pb, (match(yr, yearRange) - 1) * length(mlb.teams) + i)
+  }
+}
+# close(pb)
+
+```
+
+
+## Step 5: Organize all relevant information into a table
+I organized the data from step 4 into a table, combining the data of both the home and away teams. The data in this table includes the away and home teams, whether the home team won the opening game, the strength rating of each team, each team's travel distance from the previous series, each team's rest from the previous series, and how far apart the two teams' home stadiums are (to estimate the away fan base travel distance).
+
+```{r analysis.table, include=TRUE}
+home.games = which(opening.games.data$Perpective == opening.games.data$Host)
+openers.cols = c("Date", "Away.Tm", "Home.Tm", "Home.Win", "Away.Rate", "Home.Rate", "Away.Travel", "Home.Travel", "Away.Rest", "Home.Rest", "Dist")
+openers.analysis = matrix(ncol = length(openers.cols), nrow = length(home.games)) %>% 
+  as.data.frame()
+names(openers.analysis) = openers.cols
+openers.analysis[, c("Date", "Home.Tm", "Away.Tm", "Home.Rest", "Home.Travel")] = opening.games.data[home.games, c("Game.Date", "Host", "Opp.Tm", "Days.Rest", "Travel.Dist")]
+openers.analysis$Home.Win = opening.games.data[home.games, "RESULT"] %>% 
+  as.character() %>% 
+  str_detect("^W")
+for (i in 1:nrow(openers.analysis)) {
+  this.row = openers.analysis[i, ]
+  opp.index = which(opening.games.data$Game.Date == (this.row$Date) & opening.games.data$Host == this.row$Home.Tm & opening.games.data$Perpective == this.row$Away.Tm)
+  if(length(opp.index) != 1){
+    next()
+  }
+  openers.analysis[i, c("Away.Travel", "Away.Rest")] = opening.games.data[opp.index, c("Travel.Dist", "Days.Rest")]
+  game.yr = year(this.row$Date)
+  openers.analysis[i, "Away.Rate"] = mlb.ratings[which(mlb.ratings$Season == game.yr & mlb.ratings$Team == this.row$Away.Tm), "Log.Rate"]
+  openers.analysis[i, "Home.Rate"] = mlb.ratings[which(mlb.ratings$Season == game.yr & mlb.ratings$Team == this.row$Home.Tm), "Log.Rate"]
+  openers.analysis[i, "Dist"] = GetSiteDist(this.row[1, c("Away.Tm", "Home.Tm")])
+}
+# lookup away team's travel/rest data and both teams' ratings
+# throw out games where the home team was found but not the away team 
+
+```
+
+## Step 6: Analyze factors behind who wins the first game of the series
+I ran several logistic regression models to estimate the impact of each of the factors listed in the table from step 5 have on determining whether the home team will win the opening game of an MLB series. 
+
+```{r analysis, include=TRUE}
+indep.vars = names(openers.analysis)[(match("Home.Win", names(openers.analysis)) + 1):ncol(openers.analysis)]
+model.formula = paste0("Home.Win ~ ", paste(indep.vars, collapse = "+")) %>% as.formula()
+all.model = glm(model.formula, data = openers.analysis, family = binomial())
+summary(all.model)
+# only the teams' ratings are statistically significant in this model 
+
+# next we will eliminate rest days from the model and instead just examine the teams' ratings, travel, and home city distance 
+rate.travel.dist = paste0("Home.Win ~ ", paste(indep.vars[c(1:4, 7)], collapse = "+")) %>%
+  as.formula() %>% 
+  glm(data = openers.analysis, family = binomial())
+summary(rate.travel.dist)
+# again, only the ratings are statistically significant
+
+# I run a model taking into account ratings, rest and distance (eliminating travel)
+rate.rest.dist = paste0("Home.Win ~ ", paste(indep.vars[c(1:2, 5:7)], collapse = "+")) %>%
+  as.formula() %>% 
+  glm(data = openers.analysis, family = binomial())
+summary(rate.rest.dist)
+# as before, only the ratings are statistically significant 
+
+# I eliminate distance from the previous model and run one for ratings and rest
+rate.rest = paste0("Home.Win ~ ", paste(indep.vars[c(1:2, 5:6)], collapse = "+")) %>%
+  as.formula() %>% 
+  glm(data = openers.analysis, family = binomial())
+summary(rate.rest)
+# the p-value for away rest is much higher than than of home rest (which is not quite significant at 0.131)
+
+# I eliminate away rest and run a model for ratings and only the home team's rest
+rate.homerest = paste0("Home.Win ~ ", paste(indep.vars[c(1:2, 6)], collapse = "+")) %>%
+  as.formula() %>% 
+  glm(data = openers.analysis, family = binomial())
+summary(rate.homerest)
+# the p-value for home rest is 0.0845, which is not quite below the 0.05 threshold for statistical significance 
+
+# I run another model to see if fan base distance is significant 
+rate.dist = paste0("Home.Win ~ ", paste(indep.vars[c(1:2, 7)], collapse = "+")) %>%
+  as.formula() %>% 
+  glm(data = openers.analysis, family = binomial())
+summary(rate.dist)
+# again, only the ratings are significant 
+
+# here is a model with just the teams' ratings 
+rate.model = paste0("Home.Win ~ ", paste(indep.vars[c(1:2)], collapse = "+")) %>%
+  as.formula() %>% 
+  glm(data = openers.analysis, family = binomial())
+summary(rate.model)
+
+
+```
+Only the two teams' ratings (and the intercept) were found to be statistically significant. We fail to reject the null hypothesis that travel, rest, and distance between teams do not contribute to determining the winner of an MLB series opener 
+
+

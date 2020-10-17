@@ -1,0 +1,114 @@
+---
+title: "NCAA Football Coaches Salary"
+author: "Matt Kalin"
+date: "8/10/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Payroll plays a large role in every sport.  Rich professional teams such as the New York Yankees are perennial championship contenders because of their ability to spend money on talent.  Although colleges don’t pay their football players millions of dollars, they do spend several figures on head coaches.  Some schools also pay millions to their assistant coaching staffs.  Schools in the Power 5 conferences (Big Ten, Big 12, ACC, SEC, Pac-12) pay their coaches more money than teams in other conferences (Sun Belt, C-USA, Mountain West, AAC, MAC).  The Power 5 conference schools also have the most successful football programs.  
+
+## Acquire Data
+We took salary data from USA Today (http://sports.usatoday.com/ncaa/salaries/).  The data are relatively easy to copy from the website and paste into Excel.  However, the data is not complete and we need to do additional work to get it in the form we want.  The data covers most of the 128 NCAA Division 1 FBS (Football Bowl Subdivision) schools.  In order to get the total coaches’ payroll, we added the salary of the Head Coach with the Assistant Pay Total.  Only 106 of the 128 schools had salary data for both the Head Coach and Assistant Coaches.  Penn State, for example, was not included in our dataset because its Assistant Coach salary was not listed. 
+I defined the All.coaches as the team's total coach payroll (the sum of the head coach's total pay and the assistant coach payroll)
+
+```{r salary.import}
+library(readxl)
+library(dplyr)
+NCAAF_coaches_salaries <- suppressWarnings(read_excel(
+  "~/Desktop/Summer 2017/NCAAF coaches salaries.xlsx", sheet = "Salary", 
+  col_types = c("numeric", "text", "text", "text", "numeric", "numeric", 
+                "numeric", "numeric", "numeric", "numeric")) %>% 
+  mutate(All.coaches = `TOTAL PAY` + `ASST PAY TOTAL`)) %>% 
+  filter(!is.na(`ASST PAY TOTAL`)) %>% # filter out teams without asst payroll included
+  dplyr::rename(HC.Salary = `TOTAL PAY`, Coach.Payroll = `All.coaches`, Asst.Payroll = `ASST PAY TOTAL`) %>% 
+  select(SCHOOL, CONF, HC.Salary, Asst.Payroll, Coach.Payroll) 
+head(NCAAF_coaches_salaries)
+
+```
+
+## Measuring Team Strength 
+
+We wanted to compare each school’s payroll to its success, so we looked at Jeff Sagarin’s College Football ratings at sagarin.com (http://sagarin.com/sports/cfsend.htm).  The data could be copied from the website and pasted into Excel, but there were some problems at first.  The data contains many columns, but we were only interested in a few: Team, Wins, Losses, and Strength of Schedule (we measured team strength using schedule-adjusted winning percentage, but Sagarin’s team power ratings which he provides on his website could also have been used).  
+
+The key issue with Sagarin’s data is that it copies into Excel as one column.  The “Text to Columns” feature (under the Data tab) on Excel can be used to solve this.  After some blank or useless columns and rows are deleted, the dataset should be easy to work with.  
+
+
+```{r sagarin.import}
+NCAAF_Sagarin <- read_excel("~/Desktop/Summer 2017/NCAAF coaches salaries.xlsx",
+                            sheet = "Sagarin")
+head(NCAAF_Sagarin)
+```
+
+
+
+I defined two metrics here: schedule rating and win/loss rating.  Schedule rating is based on Sagarin's SCHEDL rating but I put it on an ELO rating scale. Sagarin's ratings typically have a mean of 55 and standard deviation of 16 for all division 1 teams.  Win/Loss rating uses the ELO inverse formula based on the team's winning percentage that season. Every FBS team won and lost at least one game in 2017 so there were no errors taking the base 10 log of each team's winning percentage. I used an inner join to combine the two datasets.    
+
+``` {r power.ratings}
+NCAAF_data = NCAAF_Sagarin %>% 
+  mutate(sched.elo = -400 * log10(1/pnorm(SCHEDL, 55, 16)-1), 
+         wl.elo = -400 * log10(1/(W / (W + L)) - 1), 
+         Wins.Rating = sched.elo + wl.elo, 
+         Record = paste(W, L, sep = "-"), 
+         Rating.Rk = rank(desc(Wins.Rating))) %>%  
+  dplyr::rename(SCHOOL = Team) %>% 
+  inner_join(NCAAF_coaches_salaries) %>% 
+  select(SCHOOL, CONF, HC.Salary, Asst.Payroll, Coach.Payroll, Wins.Rating, Record, Rating.Rk)
+head(NCAAF_data)
+```
+
+
+Here I plotted each team's total coach payroll against its strength rating.  
+``` {r plot}
+{
+  plot((NCAAF_data$Coach.Payroll)/1000000, (NCAAF_data$Wins.Rating), xlab = 
+         "Head and Assistant Coach Payroll ($Millions)", ylab = 
+         "Schedule-Adjusted Win-Loss Record ELO Rating", 
+       main = "Team Wins Strength vs. Coach Payroll")
+  plotTeamPoint = function(team){
+    team.index = match(team, NCAAF_data$SCHOOL)
+    text(NCAAF_data[team.index, "Coach.Payroll"] / 1000000, 
+         NCAAF_data[team.index, "Wins.Rating"], 
+         labels = team, pos = 1, cex = 0.8)
+  }
+  plotTeamPoint("Western Michigan")
+  plotTeamPoint("Alabama")
+  plotTeamPoint("Clemson")
+  plotTeamPoint("Michigan")
+  plotTeamPoint("Ohio State")
+  {
+    ncaaf.payroll.model = lm(Wins.Rating ~ Coach.Payroll, data = NCAAF_data)
+    abline(coef(ncaaf.payroll.model)[1], coef(ncaaf.payroll.model)[2] * 1000000, col="red")
+  } # trend line 
+  summary(ncaaf.payroll.model)
+  print(paste("Correlation coefficient:", round(cor(NCAAF_data$Wins.Rating, NCAAF_data$Coach.Payroll), 2)))
+} # graph
+
+
+```
+
+As you can see, there is a strong positive correlation (r = 0.75) between a team's coaching payroll and its strength rating.  Every additional million dollars spent on coaching leads to an additional 60 ELO points, which is the difference between a 5-win team with no postseason and a 6-win team that qualifies for a bowl game. This makes sense because the best coaches provide a lot of value to the school, so they get paid a lot of money to field a winning team.  
+
+
+
+I also looked into how the average coach payroll and strength rating differed by conference. 
+
+``` {r confs}
+confs = c("SEC", "Big Ten", "Big 12", "Pac-12", "ACC", "AAC","Ind.","Mt. West",
+        "C-USA", "Sun Belt", "MAC")
+NCAAF_Conferences = NCAAF_data %>% 
+  group_by(CONF) %>% 
+  dplyr::summarize(Avg.Payroll = mean(Coach.Payroll), Avg.Rating = mean(Wins.Rating)) %>% 
+  arrange(desc(Avg.Payroll))
+
+NCAAF_Conferences
+
+```
+
+Unsurprisingly, the Power Five conferences have the highest paid coaches and the best teams. There is a large drop off between 5th ranked Pac-12 and 6th ranked AAC. This makes sense because the Power Five schools have much more funding to put towards their football program so they can get the best possible coaches and players.  
+
